@@ -54,43 +54,50 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
+    // A write fault, a kernel write, or a remap removes the block from
+    // clean. While every block is still guarded, the journal already has
+    // the latest writes for every shadow. Avoid walking the VM region.
+    let clean_view = guarded && guards().clean.range(first..last).count() == last - first;
+    if !clean_view {
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        let now = j.asked + 1;
+        if failed {
+            if !guarded {
+                return None;
+            }
+            for page in guard(first * PAGE, last * PAGE)? {
+                j.written.insert(page, now);
+            }
+        } else {
+            for &at in &j.found[..count] {
+                j.written.insert(at / PAGE, now);
+            }
         }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        Vec::new()
-    };
+    }
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
+        add(C::CleanViews, u64::from(clean_view));
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
     Some((
         now,
         j.written
@@ -126,8 +133,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Queries, 1);
+        add(C::QueryUs, started.elapsed().as_micros() as u64);
+    }
     if n == 0 || info.Type != MEM_MAPPED {
         return None;
     }
@@ -291,6 +306,43 @@ mod tests {
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     #[test]
+    #[ignore = "benchmark"]
+    fn clean_view_checks() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        const SIZE: usize = 174 << 20;
+        // SAFETY: create and map our own pagefile section, then close the handle.
+        let mapping = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let mapping = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            mapping
+        };
+        let start = mapping.Value as usize;
+        assert_ne!(start, 0);
+        writes(start, start + SIZE, true).unwrap();
+        let timed = std::time::Instant::now();
+        for i in 0..1024 {
+            let at = start + (i % 128) * PAGE;
+            std::hint::black_box(writes(at, at + PAGE, true).unwrap());
+        }
+        println!("1024 clean 64 KiB checks in a 174 MiB view: {:?}", timed.elapsed());
+        title_memory_remapped(start, SIZE);
+        // SAFETY: this view is exclusively owned by the test.
+        unsafe { UnmapViewOfFile(mapping) };
+    }
+
+    #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -303,12 +355,13 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        let (baseline, _) = writes(start, end, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        // The allocator may have reused addresses already in the journal.
+        let changed: Vec<_> = after.into_iter().filter(|&(_, w)| w > baseline).collect();
+        assert_eq!(changed, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
@@ -348,7 +401,9 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        let (first, initial) = writes(view, view + 2 * BLOCK, true).unwrap();
+        assert_eq!(initial, [(view / BLOCK, first), (view / BLOCK + 1, first)]);
+        assert_eq!(writes(view, view + 2 * BLOCK, true).unwrap().1, initial);
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         // `ReadFile` inside: the kernel writes the view.
@@ -363,7 +418,15 @@ mod tests {
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
         assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
-        assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
+        let (next, dirty) = writes(view, view + 2 * BLOCK, true).unwrap();
+        assert_eq!(dirty, [(view / BLOCK, next), (view / BLOCK + 1, first)]);
+        // A direct CPU write faults, opens the block and makes the next
+        // query observe it even after a clean check.
+        assert_eq!(writes(view, view + 2 * BLOCK, true).unwrap().1, dirty);
+        // SAFETY: the installed handler restores write access to our view.
+        unsafe { ((view + BLOCK) as *mut u8).write_volatile(1) };
+        let (later, dirty) = writes(view, view + 2 * BLOCK, true).unwrap();
+        assert_eq!(dirty, [(view / BLOCK, next), (view / BLOCK + 1, later)]);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);

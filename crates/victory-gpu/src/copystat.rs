@@ -14,8 +14,8 @@ pub(crate) enum C {
     CopyBytes,
     Refreshes,
     RefreshBytes,
-    Skipped,
-    SkippedBytes,
+    Gaps,
+    UnwatchedBytes,
     Runs,
     RunUs,
     Queries,
@@ -37,8 +37,9 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    CleanViews,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = C::CleanViews as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -55,19 +56,19 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
-/// Per source range (start, length): copies, bytes, microseconds, memory type.
-type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
+/// Per requested source range: updates, copied bytes, microseconds.
+type Ranges = HashMap<(usize, usize), (u64, u64, u64)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
-/// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+/// A refresh of `len` bytes from `src` actually copied `copied` bytes.
+pub(crate) fn range(src: usize, len: usize, us: u64, copied: usize) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
         .get_or_insert_with(HashMap::new)
         .entry((src, len))
-        .or_insert((0, 0, 0, kind));
+        .or_default();
     e.0 += 1;
-    e.1 += len as u64;
+    e.1 += copied as u64;
     e.2 += us;
 }
 
@@ -99,17 +100,17 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
+         {:.1} MB gaps excluded, {:.1} MB unwatched copies; {:.0} runs {:.1} ms; {:.0} guard VM queries {:.2} ms, first reads {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         changed, {:.1} MB hashed, {:.1} MB of them changed; {:.0} clean view checks",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
         c[C::Refreshes as usize],
         mb(c[C::RefreshBytes as usize]),
-        c[C::Skipped as usize],
-        mb(c[C::SkippedBytes as usize]),
+        mb(c[C::Gaps as usize]),
+        mb(c[C::UnwatchedBytes as usize]),
         c[C::Runs as usize],
         ms(c[C::RunUs as usize]),
         c[C::Queries as usize],
@@ -126,11 +127,12 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+        c[C::CleanViews as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    ranges.sort_by_key(|&(_, (_, bytes, _))| std::cmp::Reverse(bytes));
+    for ((src, len), (n, bytes, us)) in ranges.into_iter().take(10) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };

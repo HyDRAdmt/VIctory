@@ -314,6 +314,8 @@ impl Shadow {
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
         self.copy(from, to);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::UnwatchedBytes, (to - from) as u64);
         to - from
     }
 

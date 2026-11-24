@@ -1229,8 +1229,8 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
+/// A submission's refreshes not done yet, merged per buffer copy without
+/// including gaps: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
@@ -1246,14 +1246,8 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+        if len != 0 {
+            self.refreshes.push((shadow.clone(), address, address + len));
         }
     }
 
@@ -1271,15 +1265,40 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        merged_refreshes(&mut self.refreshes, |shadow, from, to| {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            crate::copystat::range(from, to - from, us, copied);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        });
+    }
+}
+
+/// Coalesce adjacent and overlapping intervals for the same destination.
+/// Two shadows can refer to the same title addresses and both need updating.
+fn merged_refreshes<T>(
+    ranges: &mut Vec<(std::sync::Arc<T>, usize, usize)>,
+    mut refresh: impl FnMut(&T, usize, usize),
+) {
+    use std::sync::Arc;
+    ranges.sort_unstable_by_key(|(s, from, _)| (Arc::as_ptr(s), *from));
+    let mut pending = ranges.drain(..).peekable();
+    while let Some((shadow, from, mut to)) = pending.next() {
+        while let Some((_, _, end)) =
+            pending.next_if(|(s, start, _)| Arc::ptr_eq(s, &shadow) && *start <= to)
+        {
+            to = to.max(end);
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some((s, start, _)) = pending.peek()
+            && Arc::ptr_eq(s, &shadow)
+        {
+            crate::copystat::add(crate::copystat::C::Gaps, (start - to) as u64);
+        }
+        refresh(&shadow, from, to);
     }
 }
 
@@ -1984,6 +2003,64 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn sparse_refreshes_preserve_gaps_and_distinct_shadows() {
+        let a = Arc::new('a');
+        let b = Arc::new('b');
+        const PAGE: usize = 64 << 10;
+        const END: usize = 64 << 20;
+        let mut ranges = vec![
+            (a.clone(), END - PAGE, END),
+            (b, 0, PAGE),
+            (a.clone(), PAGE / 2, PAGE),
+            (a.clone(), 0, PAGE / 2),
+            (a, 32, PAGE),
+        ];
+        let mut copied = Vec::new();
+        super::merged_refreshes(&mut ranges, |s, from, to| copied.push((*s, from, to)));
+        copied.sort_unstable();
+        assert_eq!(
+            copied,
+            [('a', 0, PAGE), ('a', END - PAGE, END), ('b', 0, PAGE)]
+        );
+        assert!(ranges.is_empty());
+    }
+
+    /// Two disjoint reads of unwatched title memory in one shadow.
+    #[test]
+    #[ignore = "benchmark"]
+    fn sparse_refresh_copy_time() {
+        const SIZE: usize = 64 << 20;
+        const PAGE: usize = 64 << 10;
+        let source: Vec<u8> = (0..SIZE).map(|i| (i >> 12) as u8).collect();
+        let mut destination = vec![0u8; SIZE];
+        let mut copy = |from, to| {
+            super::copy_mapped(
+                destination.as_mut_ptr().wrapping_add(from),
+                source.as_ptr().wrapping_add(from),
+                to - from,
+                false,
+            );
+        };
+        copy(0, SIZE); // fault in the destination before timing
+        let shadow = Arc::new(());
+        for exact in [false, true] {
+            let started = std::time::Instant::now();
+            for _ in 0..16 {
+                if exact {
+                    let mut ranges =
+                        vec![(shadow.clone(), 0, PAGE), (shadow.clone(), SIZE - PAGE, SIZE)];
+                    super::merged_refreshes(&mut ranges, |_, from, to| copy(from, to));
+                } else {
+                    copy(0, SIZE);
+                }
+            }
+            let bytes = if exact { 2 * PAGE } else { SIZE };
+            println!("{} KiB per flush in {:?}", bytes >> 10, started.elapsed() / 16);
+        }
+        assert_eq!(destination, source);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
